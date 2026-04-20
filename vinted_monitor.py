@@ -1,160 +1,151 @@
-import aiohttp
 import asyncio
-import json
 import os
+import aiohttp
+import requests
 
 # ─────────────────────────────────────────
-#  INSTELLINGEN — pas dit aan
+#  INSTELLINGEN — zet dit in Railway Variables
 # ─────────────────────────────────────────
-WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK", "JOUW_WEBHOOK_URL_HIER")
+WEBHOOK_URL    = os.environ.get("DISCORD_WEBHOOK", "")
+VINTED_COOKIE  = os.environ.get("VINTED_COOKIE", "")   # access_token_web waarde
+CHECK_INTERVAL = 30
 
-# Elektronica categorie IDs (pas aan naar wens)
-# 1245 = Elektronica algemeen
-# 2312 = Mobiele telefoons
-# 2313 = Laptops & computers
-# 2314 = Tablets
-# 2315 = Spelconsoles
-# 2316 = Camera's
-# 1682 = Koptelefoons & audio
-CATALOG_IDS = "1245"        # Elektronica algemeen (bevat alles)
-COUNTRY_ID  = "16"          # Nederland = 16
-CHECK_INTERVAL = 30         # seconden tussen checks
+CATALOG_ID  = "1245"  # Elektronica algemeen
+COUNTRY_ID  = "16"    # Nederland
+BASE_URL    = "https://www.vinted.nl"
 
-# ─────────────────────────────────────────
-#  VINTED API URL
-# ─────────────────────────────────────────
-API_URL = (
-    "https://www.vinted.nl/api/v2/catalog/items"
-    f"?catalog_ids={CATALOG_IDS}"
-    f"&country_ids={COUNTRY_ID}"
-    "&order=newest_first"
-    "&per_page=50"
-)
+seen_ids: set[str] = set()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json",
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "application/json",
     "Accept-Language": "nl-NL,nl;q=0.9",
+    "Referer":         "https://www.vinted.nl/catalog",
 }
 
-seen_ids: set[int] = set()
+def get_cookies() -> dict:
+    return {"access_token_web": VINTED_COOKIE} if VINTED_COOKIE else {}
 
 
-async def get_session_cookie(session: aiohttp.ClientSession) -> dict:
-    """Haal een sessie cookie op van Vinted zodat de API werkt."""
+def fetch_items() -> list:
     try:
-        async with session.get("https://www.vinted.nl", headers=HEADERS) as r:
-            return {c.key: c.value for c in session.cookie_jar}
-    except Exception as e:
-        print(f"[cookie] Fout: {e}")
-        return {}
-
-
-async def fetch_items(session: aiohttp.ClientSession) -> list[dict]:
-    """Haal nieuwe listings op van de Vinted API."""
-    try:
-        async with session.get(API_URL, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status != 200:
-                print(f"[API] Status {r.status}")
-                return []
-            data = await r.json()
-            return data.get("items", [])
+        r = requests.get(
+            f"{BASE_URL}/api/v2/catalog/items",
+            params={
+                "catalog_ids": CATALOG_ID,
+                "country_ids": COUNTRY_ID,
+                "order":       "newest_first",
+                "per_page":    "96",
+            },
+            headers=HEADERS,
+            cookies=get_cookies(),
+            timeout=15,
+        )
+        if r.status_code == 401:
+            print("⚠️  Cookie verlopen! Update VINTED_COOKIE in Railway Variables.")
+            return []
+        if r.status_code != 200:
+            print(f"[API] Status {r.status_code}")
+            return []
+        return r.json().get("items", [])
     except Exception as e:
         print(f"[fetch] Fout: {e}")
         return []
 
 
-def has_no_reviews(item: dict) -> bool:
-    """Geeft True als de verkoper nog geen reviews heeft."""
-    user = item.get("user", {})
-    feedback_count = user.get("feedback_count", 0)
-    return feedback_count == 0
+def fetch_user(user_id: str) -> dict | None:
+    try:
+        r = requests.get(
+            f"{BASE_URL}/api/v2/users/{user_id}",
+            headers=HEADERS,
+            cookies=get_cookies(),
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        u = r.json().get("user", {})
+        return {
+            "country":  (u.get("country_iso_code") or "").upper(),
+            "posCount": int(u.get("positive_feedback_count") or 0),
+        }
+    except Exception as e:
+        print(f"[user] Fout: {e}")
+        return None
 
 
-async def send_to_discord(session: aiohttp.ClientSession, item: dict):
-    """Stuur een embed naar Discord via de webhook."""
-    title     = item.get("title", "Onbekend item")
+def is_match(item: dict) -> bool:
+    user_id = str(item.get("user", {}).get("id", ""))
+    if not user_id:
+        return False
+    user = fetch_user(user_id)
+    if not user:
+        return False
+    return user["country"] == "NL" and user["posCount"] == 0
+
+
+async def send_discord(session: aiohttp.ClientSession, item: dict):
+    title     = item.get("title", "Onbekend")
     price     = item.get("price", {}).get("amount", "?")
-    currency  = item.get("price", {}).get("currency_code", "EUR")
-    condition = item.get("status", "Onbekend")
     url       = item.get("url", "")
-    if not url.startswith("http"):
-        url = "https://www.vinted.nl" + url
-
-    # Foto
+    if url and not url.startswith("http"):
+        url = BASE_URL + url
+    seller    = item.get("user", {}).get("login", "Onbekend")
     photos    = item.get("photos", [])
     image_url = photos[0].get("url", "") if photos else ""
 
-    # Verkoper info
-    user      = item.get("user", {})
-    seller    = user.get("login", "Onbekend")
-
     embed = {
         "title": title,
-        "url": url,
-        "color": 0x09B1BA,  # Vinted teal kleur
+        "url":   url,
+        "color": 0x09B1BA,
         "fields": [
-            {"name": "💶 Prijs",    "value": f"€{price}",   "inline": True},
-            {"name": "📦 Staat",    "value": condition,      "inline": True},
-            {"name": "👤 Verkoper", "value": seller,         "inline": True},
-            {"name": "⭐ Reviews",  "value": "Nog geen reviews", "inline": True},
-            {"name": "🇳🇱 Land",   "value": "Nederland",    "inline": True},
+            {"name": "💶 Prijs",    "value": f"€{price}",    "inline": True},
+            {"name": "👤 Verkoper", "value": seller,          "inline": True},
+            {"name": "⭐ Reviews",  "value": "Geen reviews",  "inline": True},
+            {"name": "🇳🇱 Land",   "value": "Nederland",     "inline": True},
         ],
         "footer": {"text": "Vinted Monitor • Elektronica NL"},
     }
     if image_url:
         embed["thumbnail"] = {"url": image_url}
 
-    payload = {"embeds": [embed]}
-
     try:
-        async with session.post(WEBHOOK_URL, json=payload) as r:
+        async with session.post(WEBHOOK_URL, json={"embeds": [embed]}) as r:
             if r.status not in (200, 204):
-                print(f"[webhook] Status {r.status}: {await r.text()}")
+                print(f"[webhook] Status {r.status}")
+            else:
+                print(f"📣 Verstuurd naar Discord: {title} — €{price}")
     except Exception as e:
-        print(f"[webhook] Fout: {e}")
+        print(f"[discord] Fout: {e}")
 
 
 async def main():
     print("🚀 Vinted Monitor gestart — Elektronica NL (geen reviews)")
+    print(f"   Cookie aanwezig: {'✅' if VINTED_COOKIE else '❌ VINTED_COOKIE niet ingesteld!'}")
+    print(f"   Webhook aanwezig: {'✅' if WEBHOOK_URL else '❌ DISCORD_WEBHOOK niet ingesteld!'}")
     print(f"   Interval: elke {CHECK_INTERVAL} seconden\n")
 
     async with aiohttp.ClientSession() as session:
-        # Eerst een sessie cookie ophalen
-        await get_session_cookie(session)
-
-        # Eerste run: sla bestaande items op zonder te pingen (geen spam bij start)
-        print("🔄 Bestaande items laden...")
-        items = await fetch_items(session)
-        for item in items:
-            seen_ids.add(item["id"])
+        print("🔄 Bestaande items laden (geen spam bij start)...")
+        for item in fetch_items():
+            seen_ids.add(str(item.get("id")))
         print(f"✅ {len(seen_ids)} bestaande items geladen. Nu live monitoren...\n")
 
-        # Hoofdloop
         while True:
             await asyncio.sleep(CHECK_INTERVAL)
 
-            items = await fetch_items(session)
-            new_count = 0
-
-            for item in items:
-                item_id = item.get("id")
+            for item in fetch_items():
+                item_id = str(item.get("id"))
                 if item_id in seen_ids:
                     continue
                 seen_ids.add(item_id)
 
-                # Filter: alleen verkopers zonder reviews
-                if not has_no_reviews(item):
-                    continue
+                title = item.get("title", item_id)
+                print(f"🔍 Nieuw item: {title} — verkoper checken...")
 
-                await send_to_discord(session, item)
-                new_count += 1
-                print(f"📣 Nieuw item: {item.get('title')} — €{item.get('price', {}).get('amount')}")
-
-            if new_count == 0:
-                print(f"[{asyncio.get_event_loop().time():.0f}s] Geen nieuwe items.")
+                if is_match(item):
+                    await send_discord(session, item)
+                else:
+                    print(f"   ↳ Niet NL of heeft reviews — overgeslagen")
 
 
 if __name__ == "__main__":
